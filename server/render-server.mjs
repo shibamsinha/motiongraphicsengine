@@ -1,0 +1,874 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+
+import { bundle } from '@remotion/bundler';
+import { canvas, drawScaled, fillRect, readPng, writePng } from './png.mjs';
+import {
+  ensureBrowser,
+  makeCancelSignal,
+  renderMedia,
+  renderStill,
+  selectComposition,
+} from '@remotion/renderer';
+
+import {
+  config,
+  ensureDirs,
+  ensureRemotionPublicDir,
+  migrateLegacyUploads,
+  ROOT,
+} from './config.mjs';
+import { error as logError, log, uptimeSeconds, warn } from './log.mjs';
+import { JobStore, outputExistsIn } from './jobs.mjs';
+import { RenderQueue } from './queue.mjs';
+import { validateRenderBody, validateSheetFrames } from './validate.mjs';
+import { RateLimiter, clientKey } from './ratelimit.mjs';
+import { capacity, sweep, usage } from './retention.mjs';
+import { resolveWithin, sendFile, serveDist } from './static.mjs';
+import {
+  isAuthorised,
+  isPublicPath,
+  makeSessionValue,
+  requestIsSecure,
+  sessionCookie,
+  signInPage,
+  wantsHtml,
+} from './auth.mjs';
+
+const ENTRY = path.join(ROOT, 'src', 'remotion', 'index.ts');
+const COMPOSITION_ID = 'MotionVideo';
+
+const IMAGE_TYPES = new Map([
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp'],
+  ['image/avif', '.avif'],
+  ['image/gif', '.gif'],
+]);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif', '.gif']);
+
+const AUDIO_TYPES = new Map([
+  ['audio/mpeg', '.mp3'],
+  ['audio/mp3', '.mp3'],
+  ['audio/wav', '.wav'],
+  ['audio/x-wav', '.wav'],
+  ['audio/wave', '.wav'],
+  ['audio/mp4', '.m4a'],
+  ['audio/x-m4a', '.m4a'],
+  ['audio/aac', '.aac'],
+  ['audio/ogg', '.ogg'],
+  ['audio/webm', '.weba'],
+  ['audio/flac', '.flac'],
+]);
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.oga', '.weba', '.flac',
+]);
+
+await ensureDirs();
+const migrated = await migrateLegacyUploads(warn);
+if (migrated > 0) log('upload.migrated', { count: migrated, to: 'uploadDir' });
+const REMOTION_PUBLIC_DIR = await ensureRemotionPublicDir();
+
+const jobs = new JobStore(config.stateDir);
+const recovered = await jobs.load(outputExistsIn(config.outDir));
+const queue = new RenderQueue({ concurrency: config.maxConcurrentRenders, jobs });
+const limiter = new RateLimiter(config.rateWindowMinutes);
+
+let bundleCache = null;
+
+const sourceSignature = async () => {
+  const stack = [path.join(ROOT, 'src')];
+  let newest = 0;
+  let count = 0;
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else {
+        const stat = await fsp.stat(full);
+        newest = Math.max(newest, stat.mtimeMs);
+        count += 1;
+      }
+    }
+  }
+  return `${count}:${Math.round(newest)}`;
+};
+
+const getBundle = async (onProgress) => {
+  const signature = await sourceSignature();
+  if (bundleCache && bundleCache.signature === signature) {
+    onProgress(1);
+    return bundleCache.serveUrl;
+  }
+  const serveUrl = await bundle({
+    entryPoint: ENTRY,
+    onProgress: (percent) => onProgress(percent / 100),
+    webpackOverride: (webpackConfig) => webpackConfig,
+    publicDir: REMOTION_PUBLIC_DIR,
+    symlinkPublicDir: true,
+  });
+  bundleCache = { serveUrl, signature };
+  return serveUrl;
+};
+
+const downloadSlug = (scenes) => {
+  const words = scenes
+    .flatMap((scene) => String(scene.text ?? '').split(/\s+/))
+    .filter(Boolean)
+    .slice(0, 4)
+    .join('-')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '');
+  return words || 'reel';
+};
+
+const opaqueName = (prefix, suffix, extension) =>
+  `${prefix}-${suffix}-${randomBytes(6).toString('hex')}${extension}`;
+
+const buildInputProps = (body) => {
+  const scenes = body.scenes;
+  const palette = body?.palette === 'ink' ? 'ink' : 'forest';
+  const format = body?.format === 'landscape' ? 'landscape' : 'portrait';
+
+  const hexMap = (source) => {
+    const out = {};
+    if (source && typeof source === 'object') {
+      for (const [name, value] of Object.entries(source)) {
+        if (
+          ['green', 'cream', 'black'].includes(name) &&
+          typeof value === 'string' &&
+          /^#[0-9a-f]{6}$/i.test(value)
+        ) {
+          out[name] = value;
+        }
+      }
+    }
+    return out;
+  };
+
+  const fields = hexMap(body?.fields);
+  const ink = hexMap(body?.ink);
+  const accent =
+    typeof body?.accent === 'string' && /^#[0-9a-f]{6}$/i.test(body.accent)
+      ? body.accent
+      : null;
+
+  const n = (value, fallback) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+
+  let overlay = null;
+  if (body?.overlay && typeof body.overlay === 'object' &&
+      typeof body.overlay.src === 'string' && body.overlay.src.trim() !== '') {
+    const o = body.overlay;
+    overlay = {
+      src: o.src.trim(),
+      x: n(o.x, 0.08),
+      y: n(o.y, 0.05),
+      width: Math.max(0.03, n(o.width, 0.26)),
+      height: Math.max(0.03, n(o.height, 0.09)),
+      fit: o.fit === 'cover' ? 'cover' : 'contain',
+      opacity: Math.min(1, Math.max(0, n(o.opacity, 1))),
+    };
+  }
+
+  let audio = null;
+  if (body?.audio && typeof body.audio === 'object' &&
+      typeof body.audio.src === 'string' && body.audio.src.trim() !== '') {
+    const a = body.audio;
+    const sourceStart = Math.max(0, n(a.sourceStart, 0));
+    const sourceEnd = Math.max(sourceStart, n(a.sourceEnd, sourceStart));
+    if (sourceEnd > sourceStart) {
+      audio = {
+        src: a.src.trim(),
+        sourceStart,
+        sourceEnd,
+        timelineStart: Math.max(0, n(a.timelineStart, 0)),
+        volume: Math.min(1, Math.max(0, n(a.volume, 1))),
+        ...(a.muted === true ? { muted: true } : {}),
+        ...(n(a.fadeIn, 0) > 0 ? { fadeIn: n(a.fadeIn, 0) } : {}),
+        ...(n(a.fadeOut, 0) > 0 ? { fadeOut: n(a.fadeOut, 0) } : {}),
+        ...(a.loop === true ? { loop: true } : {}),
+      };
+    }
+  }
+
+  return {
+    scenes,
+    palette,
+    fields,
+    ...(Object.keys(ink).length > 0 ? { ink } : {}),
+    ...(accent ? { accent } : {}),
+    ...(overlay ? { overlay } : {}),
+    ...(audio ? { audio } : {}),
+    ...(format === 'landscape' ? { format } : {}),
+  };
+};
+
+const runRenderJob = async (jobId, inputProps, downloadName) => {
+  const started = Date.now();
+  const set = (patch) => jobs.update(jobId, patch);
+
+  const { cancelSignal, cancel } = makeCancelSignal();
+  jobs.setCancel(jobId, cancel);
+  set({ status: 'browser', progress: 0, startedAt: new Date().toISOString() });
+
+  try {
+    await ensureBrowser({
+      onBrowserDownload: () => ({
+        version: null,
+        onProgress: ({ percent }) => set({ progress: percent }),
+      }),
+    });
+
+    set({ status: 'bundling', progress: 0 });
+    const serveUrl = await getBundle((progress) => set({ progress }));
+
+    set({ status: 'rendering', progress: 0 });
+    const composition = await selectComposition({ serveUrl, id: COMPOSITION_ID, inputProps });
+
+    const filename = opaqueName('reel', `${composition.durationInFrames}f`, '.mp4');
+    const outputLocation = path.join(config.outDir, filename);
+    set({ filename, frames: composition.durationInFrames });
+
+    await renderMedia({
+      composition,
+      serveUrl,
+      codec: 'h264',
+      outputLocation,
+      inputProps,
+      crf: 17,
+      x264Preset: 'slow',
+      pixelFormat: 'yuv420p',
+      colorSpace: 'bt709',
+      audioCodec: null,
+      chromiumOptions: { disableWebSecurity: false },
+      cancelSignal,
+      onProgress: ({ progress }) => set({ progress }),
+    });
+
+    const ms = Date.now() - started;
+    set({
+      status: 'done',
+      progress: 1,
+      filename,
+      downloadName: `${downloadName}.mp4`,
+      ms,
+      frames: composition.durationInFrames,
+      completedAt: new Date().toISOString(),
+    });
+    log('render.completed', {
+      jobId, frames: composition.durationInFrames, ms, result: 'done',
+    });
+  } catch (problem) {
+    const message = problem instanceof Error ? problem.message : String(problem);
+    const wasCancelled = jobs.get(jobId)?.status === 'cancelled' || /cancel/i.test(message);
+    if (wasCancelled) {
+      log('render.cancelled', { jobId, ms: Date.now() - started, result: 'cancelled' });
+      set({
+        status: 'cancelled',
+        progress: 0,
+        message: 'Cancelled.',
+        completedAt: new Date().toISOString(),
+      });
+      return;
+    }
+    logError('render.failed', { jobId, ms: Date.now() - started, message, result: 'error' });
+    set({
+      status: 'error',
+      progress: 0,
+      message,
+      completedAt: new Date().toISOString(),
+    });
+  }
+};
+
+const json = (res, code, body, extraHeaders = {}) => {
+  const payload = JSON.stringify(body);
+  res.writeHead(code, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+    ...extraHeaders,
+  });
+  res.end(payload);
+};
+
+class TooLarge extends Error {
+  constructor() {
+    super('Payload too large');
+    this.tooLarge = true;
+  }
+}
+
+const readRaw = (req, limit) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let refused = false;
+    req.on('data', (chunk) => {
+      if (refused) return;
+      size += chunk.length;
+      if (size > limit) {
+        refused = true;
+        req.pause();
+        reject(new TooLarge());
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!refused) resolve(Buffer.concat(chunks));
+    });
+    req.on('error', (problem) => {
+      if (!refused) reject(problem);
+    });
+  });
+
+const tooLargeResponse = (res, message) =>
+  json(res, 413, { error: message }, { Connection: 'close' });
+
+const readBody = async (req) =>
+  (await readRaw(req, config.maxJsonBytes)).toString('utf8');
+
+const withComposition = async (inputProps, work) => {
+  await ensureBrowser();
+  const serveUrl = await getBundle(() => {});
+  const composition = await selectComposition({ serveUrl, id: COMPOSITION_ID, inputProps });
+  return work(serveUrl, composition);
+};
+
+const runStill = async (inputProps, requestedFrame) =>
+  withComposition(inputProps, async (serveUrl, composition) => {
+    const frame = Number.isFinite(requestedFrame)
+      ? Math.min(composition.durationInFrames - 1, Math.max(0, Math.round(requestedFrame)))
+      : Math.floor(composition.durationInFrames / 2);
+
+    const filename = opaqueName('still', String(frame), '.png');
+    const output = path.join(config.outDir, filename);
+
+    await renderStill({
+      composition, serveUrl, output, inputProps, frame,
+      imageFormat: 'png',
+      chromiumOptions: { disableWebSecurity: false },
+    });
+
+    const { size } = await fsp.stat(output);
+    return {
+      filename,
+      url: `/out/${filename}`,
+      frame,
+      durationInFrames: composition.durationInFrames,
+      width: composition.width,
+      height: composition.height,
+      bytes: size,
+    };
+  });
+
+const runContactSheet = async (inputProps, wanted, requestedColumns) =>
+  withComposition(inputProps, async (serveUrl, composition) => {
+    const checked = validateSheetFrames(wanted, composition.durationInFrames, config);
+    if (!checked.ok) throw new Error(checked.error);
+    const frames = checked.frames;
+
+    const columns = Math.max(
+      1,
+      Math.min(6, Math.round(Number(requestedColumns) || 0) || Math.ceil(Math.sqrt(frames.length))),
+    );
+    const rows = Math.ceil(frames.length / columns);
+
+    const gap = 8;
+    const targetWidth = 1400;
+    const cellWidth = Math.max(80, Math.floor((targetWidth - gap * (columns + 1)) / columns));
+    const cellHeight = Math.max(
+      80,
+      Math.round((cellWidth * composition.height) / composition.width),
+    );
+
+    const sheet = canvas(
+      columns * cellWidth + gap * (columns + 1),
+      rows * cellHeight + gap * (rows + 1),
+      [18, 18, 18],
+    );
+
+    const temp = [];
+    const cells = [];
+    try {
+      for (let i = 0; i < frames.length; i++) {
+        const file = path.join(config.outDir, opaqueName('sheet', String(i), '.png'));
+        await renderStill({
+          composition, serveUrl, output: file, inputProps, frame: frames[i],
+          imageFormat: 'png',
+          chromiumOptions: { disableWebSecurity: false },
+        });
+        temp.push(file);
+
+        const column = i % columns;
+        const row = Math.floor(i / columns);
+        const x = gap + column * (cellWidth + gap);
+        const y = gap + row * (cellHeight + gap);
+
+        drawScaled(sheet, readPng(file), x, y, cellWidth, cellHeight);
+        fillRect(sheet, x, y + cellHeight - 1, cellWidth, 1, [60, 60, 60]);
+
+        cells.push({ index: i, frame: frames[i], column, row, x, y, width: cellWidth, height: cellHeight });
+      }
+
+      const filename = opaqueName('contact', String(frames.length), '.png');
+      const output = path.join(config.outDir, filename);
+      writePng(output, sheet);
+      const { size } = await fsp.stat(output);
+
+      return {
+        filename,
+        url: `/out/${filename}`,
+        width: sheet.width,
+        height: sheet.height,
+        columns,
+        rows,
+        bytes: size,
+        cells,
+        durationInFrames: composition.durationInFrames,
+      };
+    } finally {
+      for (const file of temp) await fsp.rm(file, { force: true });
+    }
+  });
+
+const handleRenderish = async (req, res, kind) => {
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (problem) {
+    if (problem?.tooLarge) {
+      log('render.rejected', { kind, reason: 'body-size' });
+      return tooLargeResponse(
+        res,
+        `Request is larger than ${Math.round(config.maxJsonBytes / 1024 / 1024)}MB`,
+      );
+    }
+    return json(res, 400, { error: 'Request body is not valid JSON.' });
+  }
+
+  const checked = validateRenderBody(body, config);
+  if (!checked.ok) {
+    log('render.rejected', { kind, reason: 'validation', field: checked.field });
+    return json(res, 400, { error: checked.error, field: checked.field });
+  }
+
+  const room = await capacity(config);
+  if (!room.ok) {
+    warn('render.rejected', { kind, reason: 'disk' });
+    return json(res, 507, { error: room.reason });
+  }
+
+  if (!queue.accepting) {
+    return json(res, 503, { error: 'The render server is shutting down.' });
+  }
+
+  const inputProps = buildInputProps(body);
+
+  if (kind === 'render') {
+    const job = jobs.create({
+      kind: 'render',
+      frames: checked.frames,
+      downloadName: downloadSlug(checked.scenes),
+    });
+    log('render.start', {
+      jobId: job.jobId, kind, frames: checked.frames, scenes: checked.scenes.length,
+      queued: queue.stats().queued,
+    });
+    queue
+      .submit(job.jobId, () => runRenderJob(job.jobId, inputProps, job.downloadName))
+      .catch(() => {});
+    return json(res, 202, { jobId: job.jobId });
+  }
+
+  const job = jobs.create({ kind, frames: checked.frames });
+  const wantsAsync = body?.async === true;
+  log('render.start', { jobId: job.jobId, kind, frames: checked.frames });
+
+  const task = async () => {
+    jobs.update(job.jobId, {
+      status: 'rendering',
+      startedAt: new Date().toISOString(),
+    });
+    const started = Date.now();
+    try {
+      const result = kind === 'still'
+        ? await runStill(inputProps, Number(body?.frame))
+        : await runContactSheet(inputProps, body?.frames, body?.columns);
+      jobs.update(job.jobId, {
+        status: 'done',
+        progress: 1,
+        filename: result.filename,
+        ms: Date.now() - started,
+        completedAt: new Date().toISOString(),
+        result,
+      });
+      log('render.completed', { jobId: job.jobId, kind, ms: Date.now() - started, result: 'done' });
+      return result;
+    } catch (problem) {
+      const message = problem instanceof Error ? problem.message : String(problem);
+      jobs.update(job.jobId, {
+        status: 'error',
+        message,
+        completedAt: new Date().toISOString(),
+      });
+      logError('render.failed', { jobId: job.jobId, kind, message, result: 'error' });
+      throw problem;
+    }
+  };
+
+  if (wantsAsync) {
+    queue.submit(job.jobId, task).catch(() => {});
+    return json(res, 202, { jobId: job.jobId });
+  }
+
+  try {
+    const result = await queue.submit(job.jobId, task);
+    if (result?.cancelled) {
+      return json(res, 409, { error: 'The job was cancelled.', jobId: job.jobId });
+    }
+    return json(res, 200, { jobId: job.jobId, ...result });
+  } catch (problem) {
+    return json(res, 500, {
+      error: problem instanceof Error ? problem.message : String(problem),
+      jobId: job.jobId,
+    });
+  }
+};
+
+const handleUpload = async (req, res, url) => {
+  try {
+    const contentType = String(req.headers['content-type'] ?? '').split(';')[0];
+
+    const declared = String(url.searchParams.get('name') ?? 'image');
+    const declaredExt = path.extname(declared).toLowerCase();
+
+    const kind = url.searchParams.get('kind') === 'audio' ? 'audio' : 'image';
+    const table = kind === 'audio' ? AUDIO_TYPES : IMAGE_TYPES;
+    const known = kind === 'audio' ? AUDIO_EXTENSIONS : IMAGE_EXTENSIONS;
+    const limit = kind === 'audio' ? config.maxAudioBytes : config.maxUploadBytes;
+
+    const extension = table.get(contentType) ?? (known.has(declaredExt) ? declaredExt : null);
+    if (!extension) {
+      log('upload.rejected', { kind, reason: 'type' });
+      return json(res, 415, {
+        error:
+          kind === 'audio'
+            ? 'Unsupported audio type. Use MP3, WAV, M4A, AAC, OGG, WebM or FLAC.'
+            : 'Unsupported image type. Use JPEG, PNG, WebP, AVIF or GIF.',
+      });
+    }
+
+    const room = await capacity(config);
+    if (!room.ok) {
+      warn('upload.rejected', { kind, reason: 'disk' });
+      return json(res, 507, { error: room.reason });
+    }
+
+    const buffer = await readRaw(req, limit);
+    if (buffer.length === 0) {
+      log('upload.rejected', { kind, reason: 'empty' });
+      return json(res, 400, { error: 'Empty upload' });
+    }
+
+    const hash = createHash('sha1').update(buffer).digest('hex').slice(0, 16);
+    const filename = `${hash}${extension === '.jpeg' ? '.jpg' : extension}`;
+    const target = path.join(config.uploadDir, filename);
+    if (!fs.existsSync(target)) await fsp.writeFile(target, buffer);
+
+    log('upload.stored', { kind, bytes: buffer.length, name: filename });
+    return json(res, 201, { src: `uploads/${filename}`, bytes: buffer.length });
+  } catch (problem) {
+    const isAudio = url.searchParams.get('kind') === 'audio';
+    if (problem?.tooLarge) {
+      const cap = isAudio ? config.maxAudioBytes : config.maxUploadBytes;
+      log('upload.rejected', { kind: isAudio ? 'audio' : 'image', reason: 'size' });
+      return tooLargeResponse(
+        res,
+        `${isAudio ? 'Audio' : 'Image'} is larger than ${
+          Math.round((cap / 1024 / 1024) * 100) / 100}MB`,
+      );
+    }
+    return json(res, 400, {
+      error: problem instanceof Error ? problem.message : String(problem),
+    });
+  }
+};
+
+const handleHealth = async (res) => {
+  const stats = await usage(config);
+  const q = queue.stats();
+  const memory = process.memoryUsage();
+  const gb = (bytes) => (bytes === null ? null : Number((bytes / 1024 ** 3).toFixed(3)));
+
+  return json(res, 200, {
+    ok: true,
+    uptimeSeconds: uptimeSeconds(),
+    renders: {
+      active: q.running,
+      queued: q.queued,
+      concurrency: q.concurrency,
+      accepting: q.accepting,
+    },
+    bundle: { built: Boolean(bundleCache) },
+    disk: {
+      outputGb: gb(stats.outBytes),
+      uploadsGb: gb(stats.uploadBytes),
+      totalGb: gb(stats.totalBytes),
+      freeGb: gb(stats.freeBytes),
+      quotaGb: config.maxDiskGb || null,
+      outputFiles: stats.outFiles,
+      uploadFiles: stats.uploadFiles,
+    },
+    memory: {
+      rssMb: Math.round(memory.rss / 1024 / 1024),
+      heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+    },
+    retentionHours: config.retentionHours || null,
+    authRequired: Boolean(config.accessToken),
+  });
+};
+
+const traversalInRawPath = (rawUrl) => {
+  const raw = String(rawUrl ?? '/').split('?')[0];
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return true;
+  }
+  if (decoded.includes('\0') || decoded.includes('\\')) return true;
+  return decoded.split('/').some((segment) => segment === '..');
+};
+
+const server = http.createServer(async (req, res) => {
+  if (traversalInRawPath(req.url)) {
+    return json(res, 400, { error: 'Bad path' });
+  }
+
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const { pathname } = url;
+  const method = req.method ?? 'GET';
+
+  try {
+    if (config.accessToken && pathname === '/__auth') {
+      if (method === 'GET') {
+        const page = signInPage();
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Content-Length': Buffer.byteLength(page),
+        });
+        return res.end(page);
+      }
+      if (method === 'POST') {
+        const gate = limiter.check(`auth:${clientKey(req, config.trustProxy)}`, 10);
+        if (!gate.allowed) {
+          res.writeHead(429, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(signInPage('Too many attempts. Wait a few minutes.'));
+        }
+        const form = new URLSearchParams(await readRaw(req, 4096).then((b) => b.toString('utf8')));
+        const supplied = form.get('token') ?? '';
+        if (!isAuthorised({ headers: { authorization: `Bearer ${supplied}` } }, config)) {
+          warn('auth.failed', {});
+          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(signInPage('That token was not accepted.'));
+        }
+        const value = makeSessionValue(config.accessToken, config.sessionHours * 3600_000);
+        res.writeHead(303, {
+          Location: '/',
+          'Set-Cookie': sessionCookie(value, {
+            secure: requestIsSecure(req),
+            maxAgeSeconds: config.sessionHours * 3600,
+          }),
+        });
+        return res.end();
+      }
+    }
+
+    if (!isPublicPath(pathname) && !isAuthorised(req, config)) {
+      if (wantsHtml(req) && method === 'GET') {
+        res.writeHead(302, { Location: '/__auth', 'Cache-Control': 'no-store' });
+        return res.end();
+      }
+      return json(res, 401, { error: 'Authentication required.' });
+    }
+
+    if (pathname === '/api/health') return handleHealth(res);
+
+    const expensive =
+      method === 'POST' &&
+      ['/api/render', '/api/still', '/api/contact-sheet', '/api/upload'].includes(pathname);
+    if (expensive) {
+      const isUpload = pathname === '/api/upload';
+      const gate = limiter.check(
+        `${isUpload ? 'up' : 'rn'}:${clientKey(req, config.trustProxy)}`,
+        isUpload ? config.rateLimitUploads : config.rateLimitRenders,
+      );
+      if (!gate.allowed) {
+        const retryAfter = Math.ceil(gate.resetMs / 1000);
+        warn(isUpload ? 'upload.rejected' : 'render.rejected', {
+          reason: 'rate-limit', path: pathname,
+        });
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'Retry-After': String(retryAfter),
+          'Cache-Control': 'no-store',
+        });
+        return res.end(JSON.stringify({
+          error: 'Too many requests. Slow down and try again shortly.',
+          retryAfterSeconds: retryAfter,
+        }));
+      }
+    }
+
+    if (method === 'POST' && pathname === '/api/render') {
+      return handleRenderish(req, res, 'render');
+    }
+    if (method === 'POST' && pathname === '/api/still') {
+      return handleRenderish(req, res, 'still');
+    }
+    if (method === 'POST' && pathname === '/api/contact-sheet') {
+      return handleRenderish(req, res, 'contact-sheet');
+    }
+    if (method === 'POST' && pathname === '/api/upload') {
+      return handleUpload(req, res, url);
+    }
+
+    if (pathname.startsWith('/api/render/') && method === 'DELETE') {
+      const jobId = pathname.slice('/api/render/'.length);
+      const job = jobs.get(jobId);
+      if (!job) return json(res, 404, { error: 'Unknown job' });
+      const outcome = queue.cancel(jobId);
+      if (!outcome) {
+        return json(res, 409, { error: `Job is already ${job.status}.`, status: job.status });
+      }
+      log('render.cancelled', { jobId, result: outcome });
+      return json(res, 200, { jobId, status: 'cancelled', wasQueued: outcome === 'queued' });
+    }
+
+    if (pathname.startsWith('/api/render/') && method === 'GET') {
+      const jobId = pathname.slice('/api/render/'.length);
+      const view = jobs.view(jobId);
+      if (!view) return json(res, 404, { error: 'Unknown job' });
+      return json(res, 200, view);
+    }
+
+    if (pathname.startsWith('/out/') && (method === 'GET' || method === 'HEAD')) {
+      const file = resolveWithin(config.outDir, pathname.slice('/out/'.length));
+      if (!file) return json(res, 400, { error: 'Bad path' });
+
+      const name = path.basename(file);
+      const record = jobs.findByFilename(name);
+      const served = await sendFile(req, res, file, {
+        download: path.extname(name).toLowerCase() === '.mp4',
+        downloadName: record?.downloadName,
+        cacheControl: 'private, max-age=300',
+      });
+      if (!served) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        return res.end('Not found');
+      }
+      return undefined;
+    }
+
+    if (pathname.startsWith('/uploads/') && (method === 'GET' || method === 'HEAD')) {
+      const file = resolveWithin(config.uploadDir, pathname.slice('/uploads/'.length));
+      if (!file || !(await sendFile(req, res, file, {
+        cacheControl: 'private, max-age=31536000, immutable',
+      }))) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        return res.end('Not found');
+      }
+      return undefined;
+    }
+
+    if ((method === 'GET' || method === 'HEAD') && !pathname.startsWith('/api/')) {
+      if (await serveDist(req, res, pathname, config.distDir)) return undefined;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    return res.end('Motion Graphics Engine render server');
+  } catch (problem) {
+    logError('request.failed', {
+      path: pathname,
+      message: problem instanceof Error ? problem.message : String(problem),
+    });
+    if (!res.headersSent) return json(res, 500, { error: 'Internal error' });
+    return res.destroy();
+  }
+});
+
+server.on('error', (problem) => {
+  if (problem.code === 'EADDRINUSE') {
+    logError('server.port-in-use', { port: config.port });
+    console.error(
+      `\n[mge] Port ${config.port} is already in use, so the render server cannot start.` +
+        '\n[mge] Usually that means a previous `npm run dev` is still running.' +
+        `\n[mge] Free it with:   lsof -ti:${config.port} | xargs kill` +
+        '\n[mge] Or pick another port:   MGE_RENDER_PORT=5321 npm run dev\n',
+    );
+    process.exit(1);
+  }
+  throw problem;
+});
+
+const sweepNow = async () => {
+  const removed = await sweep(config, jobs.activeFilenames());
+  if (removed.outputs > 0 || removed.temp > 0) {
+    log('retention.swept', {
+      outputs: removed.outputs, temp: removed.temp,
+      mb: Math.round(removed.bytes / 1024 / 1024),
+    });
+  }
+};
+
+const sweepTimer = setInterval(() => void sweepNow(), config.sweepMinutes * 60_000);
+sweepTimer.unref();
+
+let shuttingDown = false;
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const dropped = queue.stop();
+  log('server.shutdown', { signal, droppedFromQueue: dropped });
+  server.close();
+  clearInterval(sweepTimer);
+  await jobs.flush();
+  process.exit(0);
+};
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+server.listen(config.port, config.host, () => {
+  log('server.started', {
+    port: config.port,
+    host: config.host,
+    concurrency: config.maxConcurrentRenders,
+    maxScenes: config.maxScenes,
+    maxTotalFrames: config.maxTotalFrames,
+    retentionHours: config.retentionHours || 'off',
+    diskQuotaGb: config.maxDiskGb || 'off',
+    auth: config.accessToken ? 'token' : 'open',
+    trustProxy: config.trustProxy,
+    dist: fs.existsSync(config.distDir) ? 'serving' : 'absent',
+    restoredJobs: recovered.restored,
+    interruptedJobs: recovered.interrupted,
+  });
+  void sweepNow();
+});
+
+export { server, jobs, queue, config };

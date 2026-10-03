@@ -1,0 +1,402 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { ProjectAudio } from '../../types/audio';
+import { AUDIO_EXTENSIONS, defaultSelection } from '../../types/audio';
+import { Group } from './Group';
+import { Disclosure } from './Disclosure';
+import { CANVAS } from '../../utils/timing';
+import {
+  cachedWaveform,
+  computeWaveform,
+  readAudioDuration,
+  shortTime,
+  timecode,
+  type Waveform,
+} from '../../utils/waveform';
+
+const assetUrl = (src: string): string =>
+  /^(https?:)?\/\//.test(src) || src.startsWith('data:') ? src : `/${src}`;
+
+type Drag = { kind: 'start' | 'end' | 'move'; grabbedAt: number; startSel: { a: number; b: number } };
+
+const WaveformStrip: React.FC<{
+  audio: ProjectAudio;
+  wave: Waveform | null;
+  onChange: (patch: Partial<ProjectAudio>) => void;
+}> = ({ audio, wave, onChange }) => {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const dragRef = useRef<Drag | null>(null);
+  const total = wave?.duration ?? audio.sourceDuration ?? 0;
+
+  const secondsAt = useCallback(
+    (clientX: number): number => {
+      const host = hostRef.current;
+      if (!host || total <= 0) return 0;
+      const rect = host.getBoundingClientRect();
+      const ratio = (clientX - rect.left) / Math.max(1, rect.width);
+      return Math.max(0, Math.min(total, ratio * total));
+    },
+    [total],
+  );
+
+  const onPointerDown = (event: React.PointerEvent, kind: Drag['kind']) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      (event.target as Element).setPointerCapture?.(event.pointerId);
+    } catch {}
+    dragRef.current = {
+      kind,
+      grabbedAt: secondsAt(event.clientX),
+      startSel: { a: audio.sourceStart, b: audio.sourceEnd },
+    };
+  };
+
+  const onPointerMove = (event: React.PointerEvent) => {
+    const drag = dragRef.current;
+    if (!drag || total <= 0) return;
+    const at = secondsAt(event.clientX);
+    const MIN = 0.2;
+
+    if (drag.kind === 'start') {
+      onChange({ sourceStart: Math.min(at, audio.sourceEnd - MIN) });
+    } else if (drag.kind === 'end') {
+      onChange({ sourceEnd: Math.max(at, audio.sourceStart + MIN) });
+    } else {
+      const length = drag.startSel.b - drag.startSel.a;
+      const shift = at - drag.grabbedAt;
+      const start = Math.max(0, Math.min(total - length, drag.startSel.a + shift));
+      onChange({ sourceStart: start, sourceEnd: start + length });
+    }
+  };
+
+  const endDrag = () => {
+    dragRef.current = null;
+  };
+
+  const pct = (seconds: number) => (total > 0 ? (seconds / total) * 100 : 0);
+
+  return (
+    <div
+      ref={hostRef}
+      className="wave"
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+    >
+      {wave ? (
+        <div className="wave-bars" aria-hidden>
+          {wave.peaks.map((peak, i) => (
+            <span
+              key={i}
+              className="wave-bar"
+              style={{ height: `${Math.max(4, peak * 100)}%` }}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="wave-pending">Reading waveform…</p>
+      )}
+
+      {total > 0 ? (
+        <>
+          <span className="wave-mask" style={{ left: 0, width: `${pct(audio.sourceStart)}%` }} />
+          <span
+            className="wave-mask"
+            style={{ left: `${pct(audio.sourceEnd)}%`, right: 0 }}
+          />
+          <span
+            className="wave-sel"
+            style={{
+              left: `${pct(audio.sourceStart)}%`,
+              width: `${Math.max(0, pct(audio.sourceEnd) - pct(audio.sourceStart))}%`,
+            }}
+            onPointerDown={(e) => onPointerDown(e, 'move')}
+          >
+            <span
+              className="wave-handle h-start"
+              onPointerDown={(e) => onPointerDown(e, 'start')}
+            />
+            <span
+              className="wave-handle h-end"
+              onPointerDown={(e) => onPointerDown(e, 'end')}
+            />
+          </span>
+        </>
+      ) : null}
+    </div>
+  );
+};
+
+export const AudioControls: React.FC<{
+  audio: ProjectAudio | null;
+  videoSeconds: number;
+  onChange: (audio: ProjectAudio | null) => void;
+  onSeekSeconds: (seconds: number) => void;
+}> = ({ audio, videoSeconds, onChange, onSeekSeconds }) => {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [wave, setWave] = useState<Waveform | null>(null);
+  const [missing, setMissing] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const src = audio ? assetUrl(audio.src) : null;
+
+  useEffect(() => {
+    if (!src) {
+      setWave(null);
+      setMissing(false);
+      return;
+    }
+    let live = true;
+    setMissing(false);
+
+    void readAudioDuration(src).then(
+      () => { if (live) setMissing(false); },
+      () => { if (live) setMissing(true); },
+    );
+
+    const hit = cachedWaveform(src);
+    if (hit) {
+      setWave(hit);
+      return;
+    }
+    setWave(null);
+    computeWaveform(src).then(
+      (result) => { if (live) setWave(result); },
+      () => { if (live) setWave(null); },
+    );
+    return () => { live = false; };
+  }, [src]);
+
+  const importFile = useCallback(
+    async (file: File | undefined) => {
+      if (!file) return;
+      setError(null);
+
+      const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+      if (!AUDIO_EXTENSIONS.includes(extension) && !file.type.startsWith('audio/')) {
+        setError(`${file.name} is not an audio file. Use MP3, WAV, M4A, AAC, OGG or FLAC.`);
+        return;
+      }
+
+      setBusy('Uploading…');
+      try {
+        const response = await fetch(
+          `/api/upload?kind=audio&name=${encodeURIComponent(file.name)}`,
+          { method: 'POST', headers: { 'Content-Type': file.type || 'audio/mpeg' }, body: file },
+        );
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload?.error ?? 'Upload failed.');
+
+        setBusy('Reading…');
+        const duration = await readAudioDuration(assetUrl(payload.src));
+
+        onChange({
+          src: payload.src,
+          name: file.name,
+          sourceDuration: duration,
+          ...defaultSelection(duration, videoSeconds),
+          timelineStart: 0,
+          volume: 1,
+        });
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : 'Could not import that audio.');
+      } finally {
+        setBusy(null);
+      }
+    },
+    [onChange, videoSeconds],
+  );
+
+  const patch = useCallback(
+    (next: Partial<ProjectAudio>) => {
+      if (!audio) return;
+      onChange({ ...audio, ...next });
+    },
+    [audio, onChange],
+  );
+
+  const picker = (
+    <input
+      ref={inputRef}
+      type="file"
+      accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+      hidden
+      onChange={(event) => {
+        void importFile(event.target.files?.[0]);
+        event.target.value = '';
+      }}
+    />
+  );
+
+  if (!audio) {
+    return (
+      <Group title="Audio">
+        {picker}
+        <div className="empty-state">
+          <p className="empty-state-text">
+            One track for the whole video. Trim the part you want; it plays on
+            the project timeline, independent of scene boundaries.
+          </p>
+          <button
+            type="button"
+            className="btn"
+            disabled={busy !== null}
+            onClick={() => inputRef.current?.click()}
+          >
+            {busy ?? 'Add audio'}
+          </button>
+        </div>
+        {error ? <p className="hint is-error">{error}</p> : null}
+      </Group>
+    );
+  }
+
+  const total = wave?.duration ?? audio.sourceDuration ?? 0;
+  const selected = Math.max(0, audio.sourceEnd - audio.sourceStart);
+  const usable = Math.max(0, Math.min(selected, videoSeconds - audio.timelineStart));
+  const clipped = selected - usable > 0.05;
+
+  return (
+    <Group title="Audio" summary={shortTime(total)}>
+        {picker}
+
+        <div className="audio-file">
+          <span className="audio-name" title={audio.name ?? audio.src}>
+            {audio.name ?? audio.src}
+          </span>
+          <button
+            type="button"
+            className="btn tiny"
+            onClick={() => inputRef.current?.click()}
+            disabled={busy !== null}
+          >
+            {busy ?? 'Replace'}
+          </button>
+          <button type="button" className="btn tiny danger" onClick={() => onChange(null)}>
+            Remove
+          </button>
+        </div>
+
+        {error ? <p className="hint is-error">{error}</p> : null}
+
+        {missing ? (
+          <p className="hint is-error">
+            This audio file could not be loaded. Its settings are kept, but the
+            video will export silent until you replace it or remove the track.
+          </p>
+        ) : null}
+
+        <WaveformStrip audio={audio} wave={wave} onChange={patch} />
+
+        <div className="audio-times">
+          <span><b>{timecode(audio.sourceStart)}</b> start</span>
+          <span><b>{timecode(audio.sourceEnd)}</b> end</span>
+          <span><b>{timecode(selected)}</b> selected</span>
+        </div>
+
+        {clipped ? (
+          <p className="hint">
+            The video is {timecode(videoSeconds)} long, so only the first{' '}
+            {timecode(usable)} of this selection will be heard.
+          </p>
+        ) : null}
+
+        <div className="field">
+          <label>Volume</label>
+          <div className="audio-volume">
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={audio.volume}
+              onChange={(e) => patch({ volume: Number(e.target.value) })}
+            />
+            <button
+              type="button"
+              className={`btn tiny${audio.muted ? ' is-on' : ''}`}
+              onClick={() => patch({ muted: !audio.muted })}
+              title={audio.muted ? 'Unmute' : 'Mute'}
+            >
+              {audio.muted ? 'Muted' : `${Math.round(audio.volume * 100)}%`}
+            </button>
+          </div>
+        </div>
+
+        <div className="chips">
+          <button
+            type="button"
+            className="btn tiny"
+            onClick={() => onSeekSeconds(audio.timelineStart)}
+            title="Move the playhead to where the audio begins"
+          >
+            Go to audio start
+          </button>
+          <button
+            type="button"
+            className="btn tiny"
+            onClick={() =>
+              patch({
+                sourceEnd: Math.min(
+                  total || audio.sourceEnd,
+                  audio.sourceStart + Math.max(0.1, videoSeconds - audio.timelineStart),
+                ),
+              })
+            }
+            title="Trim the selection to exactly what the video can play"
+          >
+            Fit to video
+          </button>
+        </div>
+
+        <Disclosure label="Placement and fades">
+          <div className="field">
+            <label>Starts at</label>
+            <div className="number-row">
+              <input
+                type="number"
+                step={0.1}
+                min={0}
+                value={audio.timelineStart}
+                onChange={(e) => patch({ timelineStart: Math.max(0, Number(e.target.value) || 0) })}
+              />
+              <span className="unit-note">
+                seconds · <b>{Math.round(audio.timelineStart * CANVAS.fps)}f</b>
+              </span>
+            </div>
+            <p className="hint">Measured from the start of the video, not of a scene.</p>
+          </div>
+
+          <div className="field-row">
+            <div className="field">
+              <label>Fade in</label>
+              <input
+                type="number"
+                step={0.1}
+                min={0}
+                value={audio.fadeIn ?? 0}
+                onChange={(e) => patch({ fadeIn: Math.max(0, Number(e.target.value) || 0) })}
+              />
+            </div>
+            <div className="field">
+              <label>Fade out</label>
+              <input
+                type="number"
+                step={0.1}
+                min={0}
+                value={audio.fadeOut ?? 0}
+                onChange={(e) => patch({ fadeOut: Math.max(0, Number(e.target.value) || 0) })}
+              />
+            </div>
+          </div>
+          <p className="hint">Both in seconds.</p>
+        </Disclosure>
+
+        <p className="hint">
+          Audio plays from the project transport below — one playhead for the
+          video and the track together.
+        </p>
+    </Group>
+  );
+};

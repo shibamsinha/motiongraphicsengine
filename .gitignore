@@ -1,0 +1,11 @@
+node_modules
+dist
+out/*
+!out/.gitkeep
+public/uploads/*
+!public/uploads/.gitkeep
+.mge/
+.mge-data/
+.claude/
+.DS_Store
+*.log

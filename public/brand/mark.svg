@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="curve" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF4D6D"/>
+      <stop offset="1" stop-color="#FFB347"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="#151925"/>
+  <rect x=".5" y=".5" width="63" height="63" rx="14.5" fill="none" stroke="#fff" stroke-opacity=".09"/>
+  <g id="handles">
+    <path d="M13 45H31M51 19H33" stroke="#fff" stroke-opacity=".28" stroke-width="1.5" stroke-linecap="round"/>
+    <circle cx="31" cy="45" r="2.3" fill="#fff" fill-opacity=".6"/>
+    <circle cx="33" cy="19" r="2.3" fill="#fff" fill-opacity=".6"/>
+  </g>
+  <path id="path" d="M13 45C36 45 28 19 51 19" fill="none" stroke="url(#curve)" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M13 40 18 45 13 50 8 45Z" fill="#fff"/>
+  <path d="M51 14 56 19 51 24 46 19Z" fill="#fff"/>
+</svg>
